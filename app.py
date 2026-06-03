@@ -1,4 +1,4 @@
-#Grok v7.2
+#Grok v8.1 (fixed)
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -8,6 +8,17 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
 import requests
+import hashlib
+import html as html_lib
+import re
+from urllib.parse import quote as _urlencode
+from email.utils import parsedate_to_datetime
+try:
+    import pytz as _pytz
+    _ET = _pytz.timezone("America/New_York")
+except ImportError:
+    _pytz = None
+    _ET = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 頁面設定
@@ -375,7 +386,6 @@ def fetch_market_data() -> dict:
             pass
     return result
 
-@st.cache_data(ttl=120)
 @st.cache_data(ttl=3600)
 def fetch_vix_history() -> pd.Series:
     """VIX 近 1 年歷史，用於趨勢判斷 & Q2百分位計算（TTL=1小時，日K不需頻繁刷新）"""
@@ -419,12 +429,11 @@ def fetch_vix_intraday() -> dict:
 
         # 轉換到 ET 時區
         try:
-            import pytz as _ptz
-            _et = _ptz.timezone("America/New_York")
-            if df.index.tzinfo is None:
-                df = df.tz_localize("UTC").tz_convert(_et)
-            else:
-                df = df.tz_convert(_et)
+            if _ET:
+                if df.index.tzinfo is None:
+                    df = df.tz_localize("UTC").tz_convert(_ET)
+                else:
+                    df = df.tz_convert(_ET)
         except Exception:
             pass
 
@@ -565,12 +574,14 @@ def fetch_vix_term_structure() -> dict:
     result["vix3m"] = vix3m
     result["vix6m"] = vix6m
 
-    # VIX 當日漲跌幅（日K）
+    # VIX 當日漲跌幅（日K）— 修復：不巢狀呼叫 @st.cache_data 函數，改為直接下載
     try:
-        vix_series = fetch_vix_history()
-        if len(vix_series) >= 2:
-            vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
-                                   / vix_series.iloc[-2] * 100)
+        _vix_daily = yf.download("^VIX", period="5d", interval="1d",
+                                  auto_adjust=True, progress=False)
+        _vix_daily.columns = [c[0] if isinstance(c, tuple) else c for c in _vix_daily.columns]
+        _vix_s = _vix_daily["Close"].dropna()
+        if len(_vix_s) >= 2:
+            vix_1d_chg_pct = float((_vix_s.iloc[-1] - _vix_s.iloc[-2]) / _vix_s.iloc[-2] * 100)
         else:
             vix_1d_chg_pct = 0
     except Exception:
@@ -650,12 +661,12 @@ def fetch_news(max_items: int = 8) -> list:
         ("MarketWatch",
          "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"),
     ]
-    BEAR_KW = ["crash","fall","drop","decline","slump","fear","recession","selloff",
-               "inflation","rate hike","sell-off","warning","risk","loss","tumble",
-               "plunge","weak","concern","worry","tariff","yield surge"]
-    BULL_KW = ["rally","surge","gain","rise","record","growth","beat","strong",
-               "upgrade","buy","bull","positive","profit","rebound","recover",
-               "outperform","soar","climb","boost","optimism"]
+    _LOCAL_BEAR = ["crash","fall","drop","decline","slump","fear","recession","selloff",
+                   "inflation","rate hike","sell-off","warning","risk","loss","tumble",
+                   "plunge","weak","concern","worry","tariff","yield surge"]
+    _LOCAL_BULL = ["rally","surge","gain","rise","record","growth","beat","strong",
+                   "upgrade","buy","bull","positive","profit","rebound","recover",
+                   "outperform","soar","climb","boost","optimism"]
 
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -697,7 +708,7 @@ def fetch_news(max_items: int = 8) -> list:
                 d_match = re.search(r"<pubDate>(.*?)</pubDate>", block)
                 raw_date = d_match.group(1).strip() if d_match else ""
                 try:
-                    from email.utils import parsedate_to_datetime
+                    # parsedate_to_datetime imported at top level
                     dt = parsedate_to_datetime(raw_date)
                     date_str = dt.strftime("%m/%d %H:%M")
                 except Exception:
@@ -705,8 +716,8 @@ def fetch_news(max_items: int = 8) -> list:
 
                 # Sentiment
                 tl = title.lower()
-                if   any(w in tl for w in BEAR_KW): sentiment = "bear"
-                elif any(w in tl for w in BULL_KW): sentiment = "bull"
+                if   any(w in tl for w in _LOCAL_BEAR): sentiment = "bear"
+                elif any(w in tl for w in _LOCAL_BULL): sentiment = "bull"
                 else:                                sentiment = "neu"
 
                 items.append({
@@ -726,35 +737,38 @@ def calc_sentiment_score(mkt: dict, vix_hist: pd.Series) -> dict:
       40% VIX 壓力（VIX 低 → 分數高）
       30% SPY 動能（近5日漲跌）
       30% QQQ 動能
+    修復：原版本用連乘加權導致實際佔比大幅偏離預設比例（VIX~19.6%/SPY~21%/QQQ~30%/初始殘留~29.4%）
+    現版本改為直接計算各分量後按目標比例加總
     """
-    score = 50.0  # 預設中性
+    # 各分量獨立計算
+    vix_score = 50.0
+    spy_score = 50.0
+    qqq_score = 50.0
 
     # VIX 分量（反向：VIX 越高 → 越恐慌 → 分數越低）
     vix_now = mkt.get("vix", {}).get("last", 20)
     if vix_now:
-        vix_score = max(0, min(100, 100 - (vix_now - 10) * 3.5))
-        score = score * 0.6 + vix_score * 0.4
+        vix_score = max(0.0, min(100.0, 100 - (vix_now - 10) * 3.5))
 
     # SPY 動能分量
     spy = mkt.get("spy", {})
     if spy:
-        spy_score = 50 + spy.get("pct", 0) * 8
-        spy_score = max(0, min(100, spy_score))
-        score = score * 0.7 + spy_score * 0.3
+        spy_score = max(0.0, min(100.0, 50 + spy.get("pct", 0) * 8))
 
     # QQQ 動能分量
     qqq = mkt.get("qqq", {})
     if qqq:
-        qqq_score = 50 + qqq.get("pct", 0) * 8
-        qqq_score = max(0, min(100, qqq_score))
-        score = score * 0.7 + qqq_score * 0.3
+        qqq_score = max(0.0, min(100.0, 50 + qqq.get("pct", 0) * 8))
+
+    # 按目標比例加總（40% VIX + 30% SPY + 30% QQQ）
+    score = vix_score * 0.4 + spy_score * 0.3 + qqq_score * 0.3
 
     # VIX 趨勢加減分
     if len(vix_hist) >= 5:
         vix_5d_chg = float(vix_hist.iloc[-1] - vix_hist.iloc[-5])
         score += -vix_5d_chg * 1.2  # VIX 5日上升 → 扣分
 
-    score = max(0, min(100, score))
+    score = max(0.0, min(100.0, score))
 
     if score >= 70:   label, color = "貪婪 🤑",    "#00ee66"
     elif score >= 55: label, color = "樂觀 😊",    "#88ff44"
@@ -1010,7 +1024,7 @@ def render_market_environment():
 
         # Mini term structure line chart
         if len(ts_points) >= 3:
-            import plotly.graph_objects as _go
+            # plotly.graph_objects already imported as go at top level
             labels = [p[0] for p in ts_points]
             values = [p[1] for p in ts_points]
             line_c = "#ff4444" if struct == "backwardation" else "#00ee66"
@@ -1085,7 +1099,6 @@ def _classify(text: str) -> str:
     return "neu"
 
 def _parse_yf_news_item(item):
-    import html as html_lib
     from datetime import timezone, datetime as _dt
     content = item.get("content", {})
     if content and isinstance(content, dict):
@@ -1113,7 +1126,6 @@ def _parse_yf_news_item(item):
 
 @st.cache_data(ttl=180)
 def fetch_stocktwits(symbol: str) -> dict:
-    import html as html_lib, re
     bull = bear = 0.0
     parsed = []
 
@@ -1136,8 +1148,8 @@ def fetch_stocktwits(symbol: str) -> dict:
     # Source 2: Google News RSS fallback
     if not parsed:
         try:
-            url  = ("https://news.google.com/rss/search"
-                    "?q=" + symbol + "+stock&hl=en-US&gl=US&ceid=US:en")
+            # 修復：URL encode symbol 防止注入
+            url  = f"https://news.google.com/rss/search?q={_urlencode(symbol)}+stock&hl=en-US&gl=US&ceid=US:en"
             resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
                 for block in re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)[:20]:
@@ -1150,7 +1162,6 @@ def fetch_stocktwits(symbol: str) -> dict:
                                                       t_m.group(1))).strip()
                     link  = l_m.group(1).strip() if l_m else "#"
                     try:
-                        from email.utils import parsedate_to_datetime
                         dt_str = parsedate_to_datetime(d_m.group(1)).strftime("%m/%d %H:%M") if d_m else ""
                     except Exception:
                         dt_str = ""
@@ -1178,7 +1189,6 @@ def fetch_reddit_sentiment(symbol: str) -> dict:
     2. Reddit JSON API search
     3. Global Reddit RSS search
     """
-    import html as html_lib, re
     from datetime import timezone
     posts = []
     bull = bear = 0
@@ -1243,7 +1253,6 @@ def fetch_reddit_sentiment(symbol: str) -> dict:
                 if not d_m:
                     d_m = re.search(r"<pubDate>(.*?)</pubDate>", entry)
                 try:
-                    from email.utils import parsedate_to_datetime
                     raw_date = d_m.group(1).strip() if d_m else ""
                     if "T" in raw_date:
                         from datetime import datetime as _dt
@@ -2317,7 +2326,15 @@ def render_entry_tracker_panel():
         time_left_str = ""
         expire_warn   = False
         try:
-            _exp = datetime.strptime(f"{datetime.now().year}/{expire_str}", "%Y/%m/%d %H:%M")
+            # 修復：支援新格式（YYYY/MM/DD HH:MM）和舊格式（MM/DD HH:MM）
+            # 新追蹤器使用完整年份，舊追蹤器 fallback 到當前年
+            if expire_str.count("/") >= 2:
+                _exp = datetime.strptime(expire_str, "%Y/%m/%d %H:%M")
+            else:
+                _exp = datetime.strptime(f"{datetime.now().year}/{expire_str}", "%Y/%m/%d %H:%M")
+                # 如果算出的時間在過去超過 6 個月，假設是跨年，加一年
+                if (_exp - datetime.now()).total_seconds() < -180 * 86400:
+                    _exp = _exp.replace(year=_exp.year + 1)
             _diff = (_exp - datetime.now()).total_seconds() / 3600
             if _diff <= 0:
                 time_left_str = "⏰ 已過期"
@@ -3021,27 +3038,59 @@ def render_signal_ai_panel():
 # ══════════════════════════════════════════════════════════════════════════════
 # Telegram
 # ══════════════════════════════════════════════════════════════════════════════
+
+# 模組級 Telegram 去重 set（不綁定 session_state，避免用戶清除警示後重複發送）
+_tg_sent_hashes: set = set()
+
 def send_telegram(msg: str):
+    """
+    發送 Telegram 通知。
+    修復：
+    1. 模組級 MD5 去重，防止 session_state.sent_alerts 清除後重複發送
+    2. 消息長度截斷至 4000 字符（Telegram 上限 4096）
+    3. 雙重防護：無活躍股票時不發送
+    """
+    global _tg_sent_hashes
     # 雙重防護：沒有活躍股票時，一律不發送
     try:
         if not st.session_state.get("_active_symbols"):
             return
     except Exception:
         return
+
+    # MD5 去重
+    msg_hash = hashlib.md5(msg.encode("utf-8", errors="replace")).hexdigest()
+    if msg_hash in _tg_sent_hashes:
+        return
+    _tg_sent_hashes.add(msg_hash)
+    # 防止無限增長
+    if len(_tg_sent_hashes) > 1000:
+        _tg_sent_hashes = set(list(_tg_sent_hashes)[-500:])
+
     try:
         token   = st.secrets["TELEGRAM_BOT_TOKEN"]
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+        # 截斷至 4000 字符，防止 Telegram API 400 錯誤
+        safe_msg = msg[:4000]
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=5,
+            data={"chat_id": chat_id, "text": safe_msg, "parse_mode": "HTML"},
+            timeout=5,
         )
     except Exception:
         pass
 
 def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
     now = datetime.now().strftime("%H:%M:%S")
-    key = f"{symbol}|{period}|{msg}"
+    # 修復：使用 MD5 壓縮 key，防止 sent_alerts 因長字符串無限增長
+    raw_key = f"{symbol}|{period}|{msg}"
+    key = hashlib.md5(raw_key.encode("utf-8", errors="replace")).hexdigest()
     if key not in st.session_state.sent_alerts:
+        # 防止 sent_alerts 無限增長（長時間運行後記憶體溢出）
+        if len(st.session_state.sent_alerts) > 2000:
+            excess = list(st.session_state.sent_alerts)
+            st.session_state.sent_alerts = set(excess[-1000:])
+
         # ── 衝突偵測：同一 symbol+period 內是否已有反向訊號 ──────────────────
         conflict_note = ""
         recent_same = [
@@ -3056,7 +3105,9 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
                     conflict_note = "　⚡【多空分歧】同時存在空頭訊號，短多但中線謹慎，勿重倉！"
                 elif atype == "bear":
                     conflict_note = "　⚡【多空分歧】同時存在多頭訊號，注意支撐，空單設好止損！"
-        final_msg = msg + conflict_note
+        # HTML 轉義外部來源的訊息內容（防止 XSS）
+        safe_msg = html_lib.escape(msg) if any(c in msg for c in "<>&\"'") else msg
+        final_msg = safe_msg + conflict_note
         st.session_state.alert_log.insert(0,
             {"時間": now, "股票": symbol, "週期": period, "訊息": final_msg, "類型": atype})
         st.session_state.alert_log = st.session_state.alert_log[:200]
@@ -3189,8 +3240,8 @@ def add_entry_tracker(symbol: str, direction: str, trigger_signal: str,
             existing[0]["trigger_signal"] = trigger_signal
             existing[0]["trigger_price"]  = trigger_price
             existing[0]["trigger_time"]   = datetime.now().strftime("%m/%d %H:%M")
-            # 重置到期時間
-            existing[0]["expire_time"]    = (datetime.now() + timedelta(hours=4)).strftime("%m/%d %H:%M")
+            # 修復：使用完整年份格式
+            existing[0]["expire_time"]    = (datetime.now() + timedelta(hours=4)).strftime("%Y/%m/%d %H:%M")
         return
 
     # ATR止損計算（若未提供ATR，使用觸發價的1.5%估算）
@@ -3217,7 +3268,8 @@ def add_entry_tracker(symbol: str, direction: str, trigger_signal: str,
         "trigger_signal": trigger_signal,
         "trigger_price":  trigger_price,
         "trigger_time":   datetime.now().strftime("%m/%d %H:%M"),
-        "expire_time":    (datetime.now() + timedelta(hours=expire_h)).strftime("%m/%d %H:%M"),
+        # 修復：儲存完整年份，防止跨年（12月→1月）解析錯誤
+        "expire_time":    (datetime.now() + timedelta(hours=expire_h)).strftime("%Y/%m/%d %H:%M"),
         "expire_h":       expire_h,
         "period_src":     period_src,
         "status":         "追蹤中",
@@ -3633,7 +3685,7 @@ def render_trading_log():
                 if risk > 0:
                     r_mults.append(t["pnl_pct"]/100*ep/risk)
             if r_mults:
-                import plotly.graph_objects as go
+                # plotly.graph_objects already imported as go at top level
                 colors = ["#00ee66" if r>=0 else "#ff5566" for r in r_mults]
                 fig = go.Figure(go.Bar(y=r_mults, marker_color=colors, opacity=0.85, marker_line_width=0))
                 fig.add_hline(y=0, line_color="#334455", line_width=1)
@@ -3848,7 +3900,7 @@ def render_trading_log():
             # 盈虧曲線
             closed_c = [t for t in st.session_state.trade_log if t["status"]=="CLOSED"]
             if len(closed_c) >= 2:
-                import plotly.graph_objects as go
+                # plotly.graph_objects already imported as go at top level
                 pnls = [t.get("pnl_pct",0) for t in reversed(closed_c)]
                 cum  = []; s=0
                 for p in pnls: s+=p; cum.append(s)
@@ -4485,8 +4537,6 @@ def render_ai_research_tab():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
-# ══════════════════════════════════════════════════════════════════════════════
 # 延長時段數據（盤前 Pre-market / 盤後 After-hours / 夜盤）
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -4497,8 +4547,7 @@ def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
     所有上層函數共享此快取，避免重複請求同一 endpoint。
     ttl=90 秒：既保持數據新鮮，又不會因頻繁刷新觸發 429。
     """
-    from urllib.parse import quote as _urlencode
-    # ^ 符號需要 URL encode，否則部分代理會拒絕請求
+    # _urlencode 已在頂部 import，此處直接使用
     encoded_symbol = _urlencode(symbol, safe="")
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -4508,6 +4557,7 @@ def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
         "Referer":  "https://finance.yahoo.com",
     }
     # 嘗試 query1，失敗自動 fallback 到 query2
+    last_err = "所有請求均失敗"   # 預先初始化，避免 NameError
     for host in ("query1", "query2"):
         url = (
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
@@ -4519,6 +4569,7 @@ def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
             if resp.status_code == 429:
                 return {"error": "Yahoo 請求過於頻繁，請稍後再試", "df": None}
             if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}"
                 continue   # 試下一個 host
             data  = resp.json()
             r_lst = data.get("chart", {}).get("result", [])
@@ -4538,8 +4589,8 @@ def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
                 "Volume": quotes.get("volume", [0]*len(timestamps)),
             }, index=pd.to_datetime(timestamps, unit="s", utc=True))
             try:
-                import pytz as _ptz
-                df = df.tz_convert(_ptz.timezone("America/New_York"))
+                if _ET:
+                    df = df.tz_convert(_ET)
             except Exception:
                 pass
             df = df.dropna(subset=["Close"])
@@ -4549,7 +4600,7 @@ def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
         except Exception as e:
             last_err = str(e)
             continue
-    return {"error": last_err if 'last_err' in dir() else "所有請求均失敗", "df": None}
+    return {"error": last_err, "df": None}
 
 
 @st.cache_data(ttl=90)
@@ -4577,11 +4628,62 @@ def fetch_data(symbol: str, interval: str, prepost: bool = False) -> pd.DataFram
     except Exception:
         return pd.DataFrame()
 
+
+@st.cache_data(ttl=300)
+def _fetch_daily_ema_direction(symbol: str) -> dict:
+    """
+    快取版日K EMA方向判斷，供 run_alerts S信號使用。
+    修復：S信號偵測器原本在每次觸發時直接呼叫 yf.download，
+    多股票×多週期時每次刷新最多發出 15+ 個額外請求，大幅增加 429 風險。
+    現在統一快取 5 分鐘。
+    """
+    try:
+        raw = yf.download(symbol, period="60d", interval="1d",
+                          auto_adjust=True, progress=False)
+        if raw is None or raw.empty:
+            return {"dir": "neutral", "label": "背景未知"}
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [c[0] for c in raw.columns]
+        cl = raw["Close"].dropna()
+        if len(cl) < 20:
+            return {"dir": "neutral", "label": "數據不足"}
+        price = float(cl.iloc[-1])
+        e20   = float(cl.ewm(span=20).mean().iloc[-1])
+        e60   = float(cl.ewm(span=min(60, len(cl))).mean().iloc[-1])
+        e200  = float(cl.ewm(span=min(200, len(cl))).mean().iloc[-1])
+        if price > e20 > e60 > e200:
+            return {"dir": "bull",    "label": "日K全EMA多頭排列"}
+        elif price < e20 < e60 < e200:
+            return {"dir": "bear",    "label": "日K全EMA空頭排列"}
+        else:
+            return {"dir": "neutral", "label": "日K震盪"}
+    except Exception:
+        return {"dir": "neutral", "label": "背景未知"}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 技術指標
 # ══════════════════════════════════════════════════════════════════════════════
 def calc_ema(s, n):  return s.ewm(span=n, adjust=False).mean()
 def calc_ma(s, n):   return s.rolling(n).mean()
+
+def calc_atr(df, period=14) -> pd.Series:
+    """
+    正確的 Average True Range（含跳空缺口）
+    True Range = max(H-L, |H-C_prev|, |L-C_prev|)
+    修復：原版本僅用 H-L，缺口行情下嚴重低估波動，導致止損設得太近
+    """
+    try:
+        hi = df["High"]; lo = df["Low"]; cl = df["Close"]
+        tr = pd.concat([
+            (hi - lo),
+            (hi - cl.shift(1)).abs(),
+            (lo - cl.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+    except Exception:
+        # fallback：退化為 H-L 均值
+        return (df["High"] - df["Low"]).rolling(period).mean()
 
 def calc_macd(s, fast=12, slow=26, sig=9):
     dif  = calc_ema(s, fast) - calc_ema(s, slow)
@@ -4779,7 +4881,6 @@ def calc_channel(df, lookback=25):
     """
     線性回歸通道：上軌/中軌/下軌 + R² + 方向
     """
-    import numpy as np
     if len(df) < lookback:
         return None
     sub   = df.tail(lookback)
@@ -5184,7 +5285,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     e60  = calc_ema(close, 60)
     dif, dea, hist = calc_macd(close)
     vol_ma5 = vol.rolling(5).mean()
-    atr = (high - low).rolling(14).mean().iloc[-1]  # Average True Range
+    atr = float(calc_atr(df, 14).iloc[-1])  # 修復：使用含跳空的 True Range ATR
 
     price      = float(close.iloc[-1])
     prev_price = float(close.iloc[-2])
@@ -6555,11 +6656,12 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                 pass
     # ══════════════════════════════════════════════════════════════════════════
     try:
-        _e5   = float(calc_ema(close, 5).iloc[-1])
-        _e10  = float(calc_ema(close, 10).iloc[-1])
-        _e20  = float(calc_ema(close, 20).iloc[-1])
-        _e30  = float(calc_ema(close, 30).iloc[-1])
-        _e60  = float(calc_ema(close, 60).iloc[-1])
+        # 修復：複用 run_alerts 頂部已計算的 e5/e10/e20/e60，避免重複計算
+        _e5   = float(e5.iloc[-1])
+        _e10  = float(e10.iloc[-1])
+        _e20  = float(e20.iloc[-1])
+        _e30  = float(calc_ema(close, 30).iloc[-1])   # e30 是此區塊獨有
+        _e60  = float(e60.iloc[-1])
         _price = float(close.iloc[-1])
 
         # 均線多頭排列：EMA5 > EMA10 > EMA20 > EMA30，且全部朝上
@@ -7872,7 +7974,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
         try:
             if len(df) >= 15:
                 _q3_dtr = float(high.iloc[-1]) - float(low.iloc[-1])
-                _q3_atr = float((high - low).rolling(14).mean().iloc[-1])
+                _q3_atr = float(calc_atr(df, 14).iloc[-1])
                 _q3_pct = (_q3_dtr / _q3_atr * 100) if _q3_atr > 0 else 0
 
                 _q3_ck = f"{symbol}|{period_label}|Q3-DTR警戒|{_bar_date(df.index[-1])}"
@@ -7936,7 +8038,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                         generate_trade_suggestion(symbol, period_label,
                                                   f"Q2-VIX極端恐慌百分位{_q2_pctile:.0f}%",
                                                   "bull", float(close.iloc[-1]),
-                                                  float((high - low).rolling(14).mean().iloc[-1]))
+                                                  float(calc_atr(df, 14).iloc[-1]))
                     elif _q2_pctile >= 75:
                         st.session_state.sent_alerts.add(_q2_ck)
                         add_alert(symbol, period_label,
@@ -7970,7 +8072,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                 _q1_v = vol.iloc[-60:].values
 
                 # 每根K線的成交量分配到其高低範圍的價格格（步長=ATR/5）
-                _q1_atr  = float((high - low).rolling(14).mean().iloc[-1])
+                _q1_atr  = float(calc_atr(df, 14).iloc[-1])
                 _q1_step = max(_q1_atr / 5, 0.5)
 
                 # 確定價格範圍
@@ -8202,7 +8304,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                 _s_hi   = float(_s_window["High"].max())
                 _s_lo   = float(_s_window["Low"].min())
                 _s_rng  = _s_hi - _s_lo
-                _s_atr  = float((high - low).rolling(14).mean().iloc[-2])  # 用前一根ATR
+                _s_atr  = float(calc_atr(df, 14).iloc[-2])  # 用前一根ATR
                 _s_rng_atr_ratio = _s_rng / max(_s_atr, 0.01)
 
                 # 壓縮閾值：區間寬度 < 1.2×ATR = 高度壓縮
@@ -8240,21 +8342,10 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                 if _s_compressed and _s_tight:
                     # ── S3. 取得背景方向（日K EMA排列 → 決定突破偏向）────
                     try:
-                        _s_daily = yf.download(symbol, period="60d", interval="1d",
-                                               auto_adjust=True, progress=False)
-                        if isinstance(_s_daily.columns, pd.MultiIndex):
-                            _s_daily.columns = [c[0] for c in _s_daily.columns]
-                        _s_d_close = _s_daily["Close"].dropna()
-                        _s_e20d = float(_s_d_close.ewm(span=20).mean().iloc[-1])
-                        _s_e60d = float(_s_d_close.ewm(span=60).mean().iloc[-1])
-                        _s_e200d= float(_s_d_close.ewm(span=200).mean().iloc[-1])
-                        _s_daily_price = float(_s_d_close.iloc[-1])
-                        if _s_daily_price > _s_e20d > _s_e60d > _s_e200d:
-                            _s_bg_dir = "bull"; _s_bg_label = "日K全EMA多頭排列"
-                        elif _s_daily_price < _s_e20d < _s_e60d < _s_e200d:
-                            _s_bg_dir = "bear"; _s_bg_label = "日K全EMA空頭排列"
-                        else:
-                            _s_bg_dir = "neutral"; _s_bg_label = "日K震盪"
+                        # 修復：使用快取函數，避免每次偵測都發出獨立 HTTP 請求
+                        _s_bg = _fetch_daily_ema_direction(symbol)
+                        _s_bg_dir   = _s_bg["dir"]
+                        _s_bg_label = _s_bg["label"]
                     except Exception:
                         _s_bg_dir = "neutral"; _s_bg_label = "背景未知"
 
@@ -8278,7 +8369,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                                    else "偏空突破" if _s_bg_dir == "bear"
                                    else "方向待定")
                         add_alert(symbol, period_label,
-                                  f"🔲 【S1·盤整壓縮{_conf_pct}%】近{_s_lookback}根K線"
+                                  f"🔲 【S1·盤整壓縮{_s_conf_pct}%】近{_s_lookback}根K線"
                                   f"區間${_s_lo:.2f}–${_s_hi:.2f}（寬{_s_rng:.2f}={_s_rng_atr_ratio:.1f}×ATR）"
                                   f"｜{_s_bg_label}背景→{_s_bias}"
                                   f"｜{_s_vix_note}"
@@ -8438,9 +8529,11 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
 
     # K 線：區分正規時段（綠/紅）和延長時段（藍/紫）
     try:
-        import pytz as _pytz
-        _et = _pytz.timezone("America/New_York")
-        _idx_et = df.index.tz_convert(_et) if df.index.tzinfo else df.index.tz_localize("UTC").tz_convert(_et)
+        _et = _ET if _ET else None
+        if _et:
+            _idx_et = df.index.tz_convert(_et) if df.index.tzinfo else df.index.tz_localize("UTC").tz_convert(_et)
+        else:
+            _idx_et = df.index
         def _is_regular(t):
             return (t.hour > 9 or (t.hour == 9 and t.minute >= 30)) and t.hour < 16
         _reg_mask = [_is_regular(t) for t in _idx_et]
@@ -8816,8 +8909,7 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
             _bx_scores.append(_sc)
 
         # 平滑（3根EMA）
-        import pandas as _pd2
-        _bx_s = _pd2.Series(_bx_scores)
+        _bx_s = pd.Series(_bx_scores)
         _bx_smooth = _bx_s.ewm(span=3, adjust=False).mean()
 
         # 顏色：深綠/亮綠/深紅/亮紅，4層強度
@@ -9487,7 +9579,7 @@ def render_traffic_light(symbol: str, df, last: float, trend: str, interval: str
     if len(df) >= 15:
         _w = df.iloc[-16:-1]
         _rng = float(_w["High"].max()) - float(_w["Low"].min())
-        _atr = float((high - low).rolling(14).mean().iloc[-1])
+        _atr = float(calc_atr(df, 14).iloc[-1])
         _compressed = _rng / max(_atr, 0.01) < 1.2
     else:
         _compressed = False
@@ -9515,7 +9607,7 @@ def render_traffic_light(symbol: str, df, last: float, trend: str, interval: str
         confidence = 40
 
     # ── 計算進場/止損/目標 ─────────────────────────────────────────────────
-    atr_val = float((high - low).rolling(14).mean().iloc[-1])
+    atr_val = float(calc_atr(df, 14).iloc[-1])
     if action in ("做多", "偏多"):
         entry  = round(last, 2)
         sl     = round(last - atr_val * 1.5, 2)
@@ -9637,9 +9729,12 @@ def render_daily_briefing(symbols: list):
     📋 每日操作簡報
     開盤前自動生成所有股票的今日計劃
     """
-    import pytz as _ptz
-    _et  = _ptz.timezone("America/New_York")
-    _now = datetime.now(_et)
+    _et  = _ET if _ET else None
+    try:
+        from datetime import timezone as _tz_mod
+        _now = datetime.now(_et) if _et else datetime.utcnow()
+    except Exception:
+        _now = datetime.utcnow()
     _is_premarket = _now.hour < 9 or (_now.hour == 9 and _now.minute < 30)
 
     st.markdown(
@@ -9741,7 +9836,10 @@ def render_daily_briefing(symbols: list):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, show_post=False, show_night=False):
+def render_single(symbol, interval, show_alerts, max_bars=90,
+                  show_pre=False, show_post=False, show_night=False,
+                  show_ai=False, show_market=False, show_social=False,
+                  show_options=False, show_mtf_keylevels=False):
     label, _ = INTERVAL_MAP[interval]
     _prepost = show_pre or show_post or show_night
     with st.spinner(f"載入 {symbol} {label} 數據中..."):
@@ -9761,13 +9859,12 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
 
     # 判斷最新數據時間和時段
     try:
-        import pytz as _ptz
-        _et = _ptz.timezone("America/New_York")
+        _et = _ET
         _last_ts = df.index[-1]
         if _last_ts.tzinfo is None:
-            _last_ts = _last_ts.tz_localize("UTC").tz_convert(_et)
+            _last_ts = _last_ts.tz_localize("UTC").tz_convert(_et) if _et else _last_ts
         else:
-            _last_ts = _last_ts.tz_convert(_et)
+            _last_ts = _last_ts.tz_convert(_et) if _et else _last_ts
         _h, _m = _last_ts.hour, _last_ts.minute
         if (_h > 9 or (_h == 9 and _m >= 30)) and _h < 16:
             _session_label = "🟢 正規盤中"
@@ -9809,8 +9906,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
 
     # 如果數據時間超過 15 分鐘，提示用戶刷新
     try:
-        from datetime import datetime as _dtnow, timezone as _tz
-        _now_et = datetime.now(_ptz.timezone("America/New_York"))
+        _now_et = datetime.now(_ET) if _ET else datetime.utcnow()
         _age_min = (_now_et - _last_ts).total_seconds() / 60
         if _age_min > 15 and _prepost:
             col_warn, col_btn = st.columns([3, 1])
@@ -10037,7 +10133,10 @@ stock_tabs = st.tabs([f"📊 {s}" for s in symbols])
 for tab, symbol in zip(stock_tabs, symbols):
     with tab:
         if mode == "單一週期":
-            render_single(symbol, single_interval, show_alerts, max_bars=max_bars, show_pre=show_pre, show_post=show_post, show_night=show_night)
+            render_single(symbol, single_interval, show_alerts, max_bars=max_bars,
+                          show_pre=show_pre, show_post=show_post, show_night=show_night,
+                          show_ai=show_ai, show_market=show_market, show_social=show_social,
+                          show_options=show_options, show_mtf_keylevels=show_mtf_keylevels)
 
         else:
             if not selected:
