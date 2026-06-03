@@ -1024,11 +1024,10 @@ def render_market_environment():
 
         # Mini term structure line chart
         if len(ts_points) >= 3:
-            # plotly.graph_objects already imported as go at top level
             labels = [p[0] for p in ts_points]
             values = [p[1] for p in ts_points]
             line_c = "#ff4444" if struct == "backwardation" else "#00ee66"
-            ts_fig = _go.Figure(_go.Scatter(
+            ts_fig = go.Figure(go.Scatter(
                 x=labels, y=values, mode="lines+markers+text",
                 line=dict(color=line_c, width=2.5),
                 marker=dict(size=8, color=line_c),
